@@ -1,55 +1,155 @@
-name: Cross-Compile Netcat (nc) for ARM32 Soft-Float (armv7l/armv5)
+name: Build Static ARM32 Netcat (Soft-Float)
 
 on:
-  push:
-    branches: [ "main", "master" ]
   workflow_dispatch:
+    inputs:
+      nc_version_note:
+        description: '备注：使用 nc110 (classic GNU netcat) 源码'
+        required: false
+        default: 'nc110'
+  push:
+    paths:
+      - '.github/workflows/build-nc.yml'
+
+env:
+  # 编译工具链前缀 —— 严格使用 softfp (gnueabi)，禁止 gnueabihf
+  CROSS_PREFIX: arm-linux-gnueabi-
+  # 兼容 armv5/v6/v7 的通用基线指令集
+  ARCH_FLAGS: "-march=armv5t -mfloat-abi=soft -marm"
 
 jobs:
-  build:
+  build-static-nc:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install ARM Soft-Float Toolchain & Build Tools
+      # -----------------------------------------------------------
+      # 1. 安装交叉编译工具链与辅助工具
+      # -----------------------------------------------------------
+      - name: 安装 ARM32 (softfp) 交叉编译工具链
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             gcc-arm-linux-gnueabi \
-            g++-arm-linux-gnueabi \
             make \
-            git \
-            libbsd-dev
+            wget \
+            curl \
+            file \
+            binutils-arm-linux-gnueabi \
+            qemu-user-static \
+            qemu-user
 
-      - name: Build Netcat (nc) statically
+      - name: 校验工具链身份（防止误用 gnueabihf）
         run: |
-          # 克隆 Debian 维护的 netcat-openbsd 源码
-          git clone --depth 1 https://salsa.debian.org/debian/netcat-openbsd.git netcat-src
-          cd netcat-src
+          echo "== 编译器版本 =="
+          ${CROSS_PREFIX}gcc --version
+          echo "== 默认目标三元组 =="
+          ${CROSS_PREFIX}gcc -dumpmachine | tee /tmp/target_triple.txt
+          if grep -q "gnueabihf" /tmp/target_triple.txt; then
+            echo "::error::检测到 gnueabihf (硬浮点) 工具链，与目标设备不匹配！"
+            exit 1
+          fi
+          echo "✅ 确认为 gnueabi (软浮点) 工具链"
 
-          # 使用 arm-linux-gnueabi-gcc 静态编译
-          # -static: 强制静态链接 C 库 (glibc/uClibc)
-          # -D_GNU_SOURCE: 开启 GNU 扩展以适配 Linux 平台
-          arm-linux-gnueabi-gcc -O2 -static -D_GNU_SOURCE \
+      # -----------------------------------------------------------
+      # 2. 获取 nc110 (classic GNU netcat) 源码
+      # -----------------------------------------------------------
+      - name: 下载 netcat (nc110) 源码
+        run: |
+          mkdir -p src && cd src
+          # 主镜像（SourceForge）；如失效可替换为你自建的镜像 URL
+          curl -L --retry 3 -o nc110.tgz \
+            "https://sourceforge.net/projects/nc110/files/latest/download" || \
+          curl -L --retry 3 -o nc110.tgz \
+            "https://distfiles.macports.org/netcat/nc110.tgz"
+
+          # 校验下载文件非空且为合法归档
+          if [ ! -s nc110.tgz ]; then
+            echo "::error::netcat 源码下载失败，请检查镜像地址"
+            exit 1
+          fi
+          tar xzf nc110.tgz
+          ls -la
+
+      # -----------------------------------------------------------
+      # 3. 交叉编译（全静态 + 架构兼容 flags）
+      # -----------------------------------------------------------
+      - name: 交叉编译 nc（全静态链接）
+        working-directory: src
+        run: |
+          # 定位实际源码目录（nc110 解包后通常直接就是当前目录内的 .c 文件）
+          SRC_DIR=$(find . -maxdepth 2 -name "netcat.c" -exec dirname {} \; | head -n1)
+          echo "源码目录: ${SRC_DIR}"
+          cd "${SRC_DIR}"
+
+          ${CROSS_PREFIX}gcc \
+            ${ARCH_FLAGS} \
+            -Os \
+            -static \
+            -DTELNET \
+            -DGAPING_SECURITY_HOLE \
+            -Wall \
             -o nc \
-            netcat.c atomicio.c socks.c \
-            -Wl,-Bstatic
+            netcat.c
 
-          # 检查编译产物的架构与静态链接属性
-          file nc
-          cd ..
+          # 去除符号表，减小体积（不影响静态特性）
+          ${CROSS_PREFIX}strip -s nc
 
-      - name: Collect & Package Artifacts
+          cp nc "${GITHUB_WORKSPACE}/nc"
+
+      # -----------------------------------------------------------
+      # 4. 验证二进制属性：架构 / ABI / 静态链接
+      # -----------------------------------------------------------
+      - name: 验证二进制文件属性 (file / readelf)
         run: |
-          mkdir -p output
-          cp netcat-src/nc output/
-          cd output
-          tar -czvf nc-armv5-softfp-static.tar.gz nc
+          echo "===== file 输出 ====="
+          file ./nc
 
-      - name: Upload Artifacts
+          echo ""
+          echo "===== readelf 动态段检查（应无 NEEDED 条目）====="
+          readelf -d ./nc 2>&1 | grep -i "NEEDED" && \
+            { echo "::error::检测到动态依赖，静态链接失败！"; exit 1; } || \
+            echo "✅ 未发现动态依赖，确认为纯静态二进制"
+
+          echo ""
+          echo "===== EABI / 浮点属性检查 ====="
+          readelf -A ./nc | grep -i "Float\|Tag_ABI"
+
+          # 强校验：文件描述必须同时包含 ARM 架构 与 statically linked
+          FILE_OUT=$(file ./nc)
+          echo "$FILE_OUT" | grep -q "ARM" || { echo "::error::非 ARM 架构"; exit 1; }
+          echo "$FILE_OUT" | grep -qi "statically linked" || { echo "::error::非静态链接"; exit 1; }
+          echo "✅ 架构与链接方式校验通过"
+
+      # -----------------------------------------------------------
+      # 5. 使用 QEMU 用户态模拟，实际执行验证（避免 Illegal instruction）
+      # -----------------------------------------------------------
+      - name: QEMU 模拟执行冒烟测试
+        run: |
+          chmod +x ./nc
+          echo "===== 使用 qemu-arm-static 执行 nc -h ====="
+          qemu-arm-static ./nc -h || {
+            echo "::error::QEMU 模拟执行失败，二进制可能存在指令集不兼容问题"
+            exit 1
+          }
+          echo "✅ 模拟执行成功，未触发 Illegal instruction"
+
+      # -----------------------------------------------------------
+      # 6. 打包并上传 Artifact
+      # -----------------------------------------------------------
+      - name: 打包产物
+        run: |
+          mkdir -p dist
+          cp ./nc dist/nc-arm32-softfp-static
+          cd dist
+          sha256sum nc-arm32-softfp-static > nc-arm32-softfp-static.sha256
+          tar czf nc-arm32-softfp-static.tar.gz nc-arm32-softfp-static nc-arm32-softfp-static.sha256
+          ls -la
+
+      - name: 上传 Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: nc-armv5-softfp-static
-          path: output/nc-armv5-softfp-static.tar.gz
+          name: nc-arm32-softfp-static
+          path: |
+            dist/nc-arm32-softfp-static
+            dist/nc-arm32-softfp-static.sha256
+            dist/nc-arm32-softfp-static.tar.gz
+          retention-days: 30
