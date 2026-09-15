@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       nc_version_note:
-        description: '备注：使用 nc110 (classic GNU netcat) 源码'
+        description: '备注：使用 nc110 (classic GNU netcat / netcat-traditional) 源码'
         required: false
         default: 'nc110'
   push:
@@ -33,12 +33,14 @@ jobs:
             wget \
             curl \
             file \
+            xxd \
             binutils-arm-linux-gnueabi \
             qemu-user-static \
             qemu-user
 
       - name: 校验工具链身份（防止误用 gnueabihf）
         run: |
+          set -e
           echo "== 编译器版本 =="
           ${CROSS_PREFIX}gcc --version
           echo "== 默认目标三元组 =="
@@ -50,35 +52,83 @@ jobs:
           echo "✅ 确认为 gnueabi (软浮点) 工具链"
 
       # -----------------------------------------------------------
-      # 2. 获取 nc110 (classic GNU netcat) 源码
+      # 2. 获取 netcat-traditional (nc110) 源码
+      #    主方案：apt-get source（走 Ubuntu 官方 archive，最稳）
+      #    备用方案：Debian 归档池直链 + 魔数校验（防止拿到 HTML 跳转页）
       # -----------------------------------------------------------
-      - name: 下载 netcat (nc110) 源码
+      - name: 主方案 - 启用 deb-src 并通过 apt 获取源码包
+        id: apt_source
+        continue-on-error: true
         run: |
+          set -e
           mkdir -p src && cd src
-          # 主镜像（SourceForge）；如失效可替换为你自建的镜像 URL
-          curl -L --retry 3 -o nc110.tgz \
-            "https://sourceforge.net/projects/nc110/files/latest/download" || \
-          curl -L --retry 3 -o nc110.tgz \
-            "https://distfiles.macports.org/netcat/nc110.tgz"
 
-          # 校验下载文件非空且为合法归档
-          if [ ! -s nc110.tgz ]; then
-            echo "::error::netcat 源码下载失败，请检查镜像地址"
+          # Ubuntu 24.04 (noble) 使用 deb822 格式 sources 文件；
+          # 兼容处理新旧两种格式，确保 deb-src 被启用
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+          else
+            sudo sed -i 's/^# deb-src/deb-src/' /etc/apt/sources.list
+          fi
+          sudo apt-get update
+
+          # apt-get source 会自动下载 .orig.tar.gz / .debian.tar.xz 并解包
+          apt-get source netcat-traditional
+
+          SRC_DIR=$(find . -maxdepth 1 -type d -name "netcat-traditional-*" | head -n1)
+          if [ -z "$SRC_DIR" ]; then
+            echo "::error::未找到 netcat-traditional 源码目录"
             exit 1
           fi
+          echo "SRC_PATH=${PWD}/${SRC_DIR}" >> "$GITHUB_ENV"
+          echo "✅ 源码已就绪（apt 方案）: ${SRC_DIR}"
+          ls -la "${SRC_DIR}"
+
+      - name: 备用方案 - 直接从 Debian 归档池下载并做魔数校验
+        if: steps.apt_source.outcome == 'failure'
+        run: |
+          set -e
+          mkdir -p src && cd src
+
+          URL="http://deb.debian.org/debian/pool/main/n/netcat-traditional/netcat-traditional_1.10.orig.tar.gz"
+          echo "尝试从备用地址下载: ${URL}"
+          curl -L --retry 3 --fail -o nc110.tgz "$URL"
+
+          # 校验文件头是否为 gzip 魔数 (1f 8b)，而不是 HTML 跳转页
+          MAGIC=$(xxd -p -l2 nc110.tgz)
+          if [ "$MAGIC" != "1f8b" ]; then
+            echo "::error::下载内容不是合法 gzip 文件（魔数=${MAGIC}），可能拿到了 HTML 页面"
+            echo "----- 文件内容预览 -----"
+            head -c 300 nc110.tgz
+            exit 1
+          fi
+
           tar xzf nc110.tgz
-          ls -la
+          SRC_DIR=$(find . -maxdepth 1 -type d -name "netcat-traditional-*" | head -n1)
+          if [ -z "$SRC_DIR" ]; then
+            echo "::error::解压后未找到源码目录"
+            exit 1
+          fi
+          echo "SRC_PATH=${PWD}/${SRC_DIR}" >> "$GITHUB_ENV"
+          echo "✅ 源码已就绪（备用方案）: ${SRC_DIR}"
+          ls -la "${SRC_DIR}"
+
+      - name: 校验源码路径最终有效
+        run: |
+          if [ -z "${SRC_PATH}" ] || [ ! -f "${SRC_PATH}/netcat.c" ]; then
+            echo "::error::未能定位到 netcat.c，源码获取彻底失败"
+            exit 1
+          fi
+          echo "最终源码路径: ${SRC_PATH}"
 
       # -----------------------------------------------------------
       # 3. 交叉编译（全静态 + 架构兼容 flags）
       # -----------------------------------------------------------
       - name: 交叉编译 nc（全静态链接）
-        working-directory: src
         run: |
-          # 定位实际源码目录（nc110 解包后通常直接就是当前目录内的 .c 文件）
-          SRC_DIR=$(find . -maxdepth 2 -name "netcat.c" -exec dirname {} \; | head -n1)
-          echo "源码目录: ${SRC_DIR}"
-          cd "${SRC_DIR}"
+          set -e
+          cd "${SRC_PATH}"
+          ls -la
 
           ${CROSS_PREFIX}gcc \
             ${ARCH_FLAGS} \
@@ -100,18 +150,22 @@ jobs:
       # -----------------------------------------------------------
       - name: 验证二进制文件属性 (file / readelf)
         run: |
+          set -e
           echo "===== file 输出 ====="
           file ./nc
 
           echo ""
           echo "===== readelf 动态段检查（应无 NEEDED 条目）====="
-          readelf -d ./nc 2>&1 | grep -i "NEEDED" && \
-            { echo "::error::检测到动态依赖，静态链接失败！"; exit 1; } || \
+          if readelf -d ./nc 2>&1 | grep -i "NEEDED"; then
+            echo "::error::检测到动态依赖，静态链接失败！"
+            exit 1
+          else
             echo "✅ 未发现动态依赖，确认为纯静态二进制"
+          fi
 
           echo ""
           echo "===== EABI / 浮点属性检查 ====="
-          readelf -A ./nc | grep -i "Float\|Tag_ABI"
+          readelf -A ./nc | grep -i "Float\|Tag_ABI" || true
 
           # 强校验：文件描述必须同时包含 ARM 架构 与 statically linked
           FILE_OUT=$(file ./nc)
@@ -124,6 +178,7 @@ jobs:
       # -----------------------------------------------------------
       - name: QEMU 模拟执行冒烟测试
         run: |
+          set -e
           chmod +x ./nc
           echo "===== 使用 qemu-arm-static 执行 nc -h ====="
           qemu-arm-static ./nc -h || {
@@ -137,6 +192,7 @@ jobs:
       # -----------------------------------------------------------
       - name: 打包产物
         run: |
+          set -e
           mkdir -p dist
           cp ./nc dist/nc-arm32-softfp-static
           cd dist
